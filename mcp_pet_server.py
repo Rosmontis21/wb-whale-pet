@@ -115,14 +115,30 @@ _we_touched_pet = False      # 只有确实安排过拉起，收尾才有资格�
 
 
 def schedule_start(client_name: str) -> None:
-    """按客户端类型决定何时（是否）拉起桌宠。"""
-    global _start_timer, _we_touched_pet
+    """
+    按客户端类型决定何时（是否）拉起桌宠。
+
+    WorkBuddy 会派两种客户端来：
+      * **探针**（`clientInfo.name` 含 `probe`）—— 应用启动时的健康检查，
+        握手后**同一秒就断开**。**这正是"开机"时机**，所以要**立即**拉起，
+        不能走延迟路径（延迟的定时器会被随后的 EOF 取消掉）。
+      * **真实客户端** —— 发消息时才连上，延迟 2.5 秒再拉，避开瞬时连接。
+
+    早期版本会跳过探针，理由是"拉起后立刻被收掉会闪现"。现在宿主已经**不再负责结束**
+    桌宠了，所以探针拉起是完全安全的 —— 她起来后就一直待着，由自己的 tie 逻辑决定何时退。
+    """
+    global _start_timer
+
     if "probe" in (client_name or "").lower():
-        log(f"探针客户端（{client_name}），跳过拉起桌宠")
+        log("探针客户端 —— 视为「WorkBuddy 已启动」信号，立即尝试拉起桌宠")
+        threading.Thread(target=start_pet, daemon=True).start()
         return
+
     if _start_timer is not None:
         return
-    _we_touched_pet = True
+    # 注意：这里**不要**标记「参与过拉起」。
+    # 只有真正 spawn 成功才算数 —— 否则那些「发现桌宠已在运行所以跳过」的实例
+    # 也会以为自己拉起过。
     _start_timer = threading.Timer(START_DELAY, start_pet)
     _start_timer.daemon = True
     _start_timer.start()
@@ -138,86 +154,101 @@ def cancel_start() -> None:
         log(f"已取消待执行的桌宠拉起（存活不足 {START_DELAY}s，多半是探针）")
 
 
+START_LOCK = os.path.join(BASE_DIR, "run", "starting.lock")
+
+
+def _release_start_lock() -> None:
+    try:
+        if os.path.exists(START_LOCK):
+            os.remove(START_LOCK)
+    except Exception:
+        pass
+
+
 def start_pet() -> bool:
-    """拉起桌宠；已在跑就不重复启动。"""
-    global _PET_PROC
+    """
+    拉起桌宠；已在跑就不重复启动。
+
+    加了短期文件锁：WorkBuddy 可能**同时** spawn 多个宿主实例，
+    而桌宠要两三秒才写出 PID 文件，光靠 pet_running() 会有竞态，
+    并发下可能拉出两只。
+    """
+    global _PET_PROC, _we_touched_pet
+
     if pet_running():
         log("桌宠已在运行，跳过启动")
         return True
     if not os.path.exists(PET_SCRIPT):
         log(f"找不到 {PET_SCRIPT}")
         return False
+
     try:
-        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(START_LOCK), exist_ok=True)
+        if os.path.exists(START_LOCK):
+            try:
+                if time.time() - os.path.getmtime(START_LOCK) > 20:
+                    os.remove(START_LOCK)          # 陈旧锁
+            except Exception:
+                pass
+        fd = os.open(START_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        log("另一个实例正在拉起桌宠，跳过（避免拉出两只）")
+        return False
+    except Exception as e:
+        log(f"抢锁异常，仍继续尝试: {type(e).__name__}: {e}")
+
+    try:
         creation = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             creation |= subprocess.CREATE_NO_WINDOW
         if hasattr(subprocess, "DETACHED_PROCESS"):
             creation |= subprocess.DETACHED_PROCESS
-        # --tie-to-workbuddy：让桌宠自己也盯着 WorkBuddy。
-        # 这样即使宿主异常消失（来不及收尾），桌宠也会自己退出，不会变成孤儿。
+        # --tie-to-workbuddy：让桌宠自己盯着 WorkBuddy 进程。
+        # 「该不该退出」由她判断 —— 宿主实例会随会话反复生灭，不能由它决定。
         _PET_PROC = subprocess.Popen(
             [pythonw(), PET_SCRIPT, "--tie-to-workbuddy"],
             cwd=BASE_DIR,
             creationflags=creation,
             close_fds=True,
         )
+        _we_touched_pet = True
         log(f"已拉起桌宠: pid={_PET_PROC.pid}")
+        threading.Timer(6.0, _release_start_lock).start()   # 留够写 PID 的时间
         return True
     except Exception as e:
         log(f"拉起桌宠失败: {type(e).__name__}: {e}")
+        _release_start_lock()
         return False
 
 
 def stop_pet() -> None:
     """
-    结束桌宠。两条路都走，确保不留孤儿：
-      1) 本宿主 spawn 的句柄（桌宠启动慢时 PID 文件还没写，只能靠它）
-      2) run/pet.pid
+    收尾时**不再结束桌宠** —— 这是被真实故障纠正过的设计。
 
-    但第 2 条只有在**本实例确实参与过拉起**时才做——否则探针实例收尾时会把
-    另一个「真实客户端」拉起来的桌宠误杀掉。
+    ⚠️ 不要在这里杀桌宠，无论是按 PID 文件还是按自己 spawn 的句柄。
+
+    原因：WorkBuddy 会**为每个会话 spawn 一个新宿主实例**，会话结束该实例就退出
+    （日志实测：同一小时内起了 5 个实例）。只要宿主退出时去杀桌宠，用户看到的现象
+    就是「宠物在某个对话结束时莫名消失」，而不是「跟着 WorkBuddy 启停」——
+    这正是用户报上来的 bug。
+
+    **正确的分工**：
+      * 宿主只负责「拉起」——发现她没在跑才拉，已在跑就什么都不做；
+      * 桌宠**自己**决定何时退出 —— 靠 `--tie-to-workbuddy` 每 5 秒检测
+        `WorkBuddy.exe`，连续缺席约 20 秒才退出。
+
+    这个判据（WorkBuddy 进程在不在）才真正对应「WorkBuddy 开 / 关」，
+    而宿主实例的生灭只对应「某个会话」，两者不是一回事。
     """
     global _PET_PROC, _we_touched_pet
-
-    if _PET_PROC is not None and _PET_PROC.poll() is None:
-        try:
-            _PET_PROC.terminate()
-            _PET_PROC.wait(timeout=5)
-            log(f"已结束桌宠（句柄 pid={_PET_PROC.pid}）")
-        except Exception:
-            try:
-                _PET_PROC.kill()
-                log(f"已强杀桌宠（句柄 pid={_PET_PROC.pid}）")
-            except Exception as e:
-                log(f"强杀桌宠失败: {type(e).__name__}: {e}")
-        _PET_PROC = None
-        _we_touched_pet = False
-        return
-
-    if not _we_touched_pet:
-        log("本实例未参与拉起，收尾不触碰桌宠")
-        return
-
-    pid = read_pid()
-    if pid and pid_alive(pid):
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/F"],
-                capture_output=True, text=True, timeout=8,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            log(f"已结束桌宠 PID={pid}")
-        except Exception as e:
-            log(f"结束桌宠失败: {type(e).__name__}: {e}")
-    elif not pid:
-        log("收尾：无 PID 文件")
-
-    try:
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-    except Exception:
-        pass
+    if _PET_PROC is not None:
+        log(f"本实例退出；桌宠（pid={_PET_PROC.pid}）**保持运行**，由她自己判断何时退出")
+    else:
+        log("本实例退出；未亲手拉起桌宠，不触碰")
+    _PET_PROC = None
+    _we_touched_pet = False
 
 
 # ---------------------------------------------------------------- 状态查询
